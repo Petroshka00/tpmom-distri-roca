@@ -1,6 +1,7 @@
 package factory
 
 import (
+	"context"
 	"fmt"
 
 	m "github.com/7574-sistemas-distribuidos/tp-mom/golang/internal/middleware"
@@ -69,14 +70,89 @@ type RabbitMQExchangeMiddleware struct {
 }
 
 func (r *RabbitMQExchangeMiddleware) StartConsuming(callbackFunc func(msg m.Message, ack func(), nack func())) error {
+	q, err := r.ch.QueueDeclare(
+		"q",
+		false,
+		true,
+		true,
+		false,
+		nil,
+	)
+	if err != nil {
+		return err
+	}
+
+	for _, key := range r.routingKeys {
+		err = r.ch.QueueBind(
+			q.Name,
+			key,
+			r.exchangeName,
+			false,
+			nil,
+		)
+		if err != nil {
+			return err
+		}
+	}
+
+	deliveries, err := r.ch.Consume(
+		q.Name,
+		"c",
+		false,
+		false,
+		false,
+		false,
+		nil,
+	)
+	if err != nil {
+		return err
+	}
+
+	for d := range deliveries {
+		delivery := d
+		ack := func() {
+			_ = delivery.Ack(false)
+		}
+		nack := func() {
+			_ = delivery.Nack(false, true)
+		}
+
+		callbackFunc(m.Message{Body: string(delivery.Body)}, ack, nack)
+	}
+
 	return nil
 }
 
 func (r *RabbitMQExchangeMiddleware) StopConsuming() error {
+	if r.ch != nil {
+		_ = r.ch.Cancel("", false)
+	}
 	return nil
 }
 
 func (r *RabbitMQExchangeMiddleware) Send(msg m.Message) error {
+	keys := r.routingKeys
+	if len(keys) == 0 {
+		keys = []string{""}
+	}
+
+	for _, key := range keys {
+		err := r.ch.PublishWithContext(
+			context.Background(),
+			r.exchangeName,
+			key,
+			false,
+			false,
+			amqp.Publishing{
+				DeliveryMode: amqp.Persistent,
+				ContentType:  "text/plain",
+				Body:         []byte(msg.Body),
+			},
+		)
+		if err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
