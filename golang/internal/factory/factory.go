@@ -15,15 +15,39 @@ type RabbitMQQueueMiddleware struct {
 }
 
 func (r *RabbitMQQueueMiddleware) StartConsuming(callbackFunc func(msg m.Message, ack func(), nack func())) error {
+	deliveries, err := r.ch.Consume(r.queueName, "", false, false, false, false, nil)
+	if err != nil {
+		return err
+	}
+
+	for d := range deliveries {
+		delivery := d
+		ack := func() {
+			_ = delivery.Ack(false)
+		}
+		nack := func() {
+			_ = delivery.Nack(false, true)
+		}
+
+		callbackFunc(m.Message{Body: string(delivery.Body)}, ack, nack)
+	}
+
 	return nil
 }
 
 func (r *RabbitMQQueueMiddleware) StopConsuming() error {
+	if r.ch != nil {
+		_ = r.ch.Cancel("", false)
+	}
 	return nil
 }
 
 func (r *RabbitMQQueueMiddleware) Send(msg m.Message) error {
-	return nil
+	return r.ch.PublishWithContext(context.Background(), "", r.queueName, false, false, amqp.Publishing{
+		DeliveryMode: amqp.Persistent,
+		ContentType:  "text/plain",
+		Body:         []byte(msg.Body),
+	})
 }
 
 func (r *RabbitMQQueueMiddleware) Close() error {
@@ -70,14 +94,7 @@ type RabbitMQExchangeMiddleware struct {
 }
 
 func (r *RabbitMQExchangeMiddleware) StartConsuming(callbackFunc func(msg m.Message, ack func(), nack func())) error {
-	q, err := r.ch.QueueDeclare(
-		"q",
-		false,
-		true,
-		true,
-		false,
-		nil,
-	)
+	q, err := r.ch.QueueDeclare("", false, true, true, false, nil)
 	if err != nil {
 		return err
 	}
@@ -95,15 +112,8 @@ func (r *RabbitMQExchangeMiddleware) StartConsuming(callbackFunc func(msg m.Mess
 		}
 	}
 
-	deliveries, err := r.ch.Consume(
-		q.Name,
-		"c",
-		false,
-		false,
-		false,
-		false,
-		nil,
-	)
+	deliveries, err := r.ch.Consume(q.Name, "", false, false, false, false, nil)
+
 	if err != nil {
 		return err
 	}
