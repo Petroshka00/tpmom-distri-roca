@@ -1,7 +1,6 @@
 package factory
 
 import (
-	"context"
 	"errors"
 	"fmt"
 
@@ -104,7 +103,7 @@ func (r *RabbitMQQueueMiddleware) Send(msg m.Message) error {
 		return m.ErrMessageMiddlewareDisconnected
 	}
 
-	err := r.ch.PublishWithContext(context.Background(), "", r.queueName, false, false, amqp.Publishing{
+	err := r.ch.Publish("", r.queueName, false, false, amqp.Publishing{
 		DeliveryMode: amqp.Persistent,
 		ContentType:  "text/plain",
 		Body:         []byte(msg.Body),
@@ -295,8 +294,7 @@ func (r *RabbitMQExchangeMiddleware) Send(msg m.Message) error {
 	}
 
 	for _, key := range keys {
-		err := r.ch.PublishWithContext(
-			context.Background(),
+		err := r.ch.Publish(
 			r.exchangeName,
 			key,
 			false,
