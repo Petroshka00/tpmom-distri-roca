@@ -26,6 +26,7 @@ func (r *RabbitMQQueueMiddleware) StartConsuming(callbackFunc func(msg m.Message
 		return m.ErrMessageMiddlewareMessage
 	}
 
+	// Tag unico por consumer para poder cancelar la suscripcion
 	r.consumerSeq++
 	tag := fmt.Sprintf("q-cons-%s-%d", r.queueName, r.consumerSeq)
 	r.consumerTag = tag
@@ -62,6 +63,7 @@ func (r *RabbitMQQueueMiddleware) StartConsuming(callbackFunc func(msg m.Message
 		callbackFunc(m.Message{Body: string(delivery.Body)}, ack, nack)
 	}
 
+	// Para distinguir entre StopConsuming y si hubo error
 	wasManual := r.manualStop
 	r.isConsuming = false
 	r.consumerTag = ""
@@ -152,6 +154,7 @@ func CreateQueueMiddleware(queueName string, connectionSettings m.ConnSettings) 
 		return nil, m.ErrMessageMiddlewareMessage
 	}
 
+	// Fair Dispatch
 	_ = ch.Qos(1, 0, false)
 
 	return &RabbitMQQueueMiddleware{
@@ -195,6 +198,7 @@ func (r *RabbitMQExchangeMiddleware) StartConsuming(callbackFunc func(msg m.Mess
 		keys = []string{""}
 	}
 
+	// Vincular la queue del suscriptor a cada topic en el exchange.
 	for _, key := range keys {
 		err = r.ch.QueueBind(
 			q.Name,
