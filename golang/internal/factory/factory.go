@@ -18,6 +18,20 @@ type RabbitMQQueueMiddleware struct {
 	manualStop  bool
 }
 
+func processDeliveries(deliveries <-chan amqp.Delivery, callbackFunc func(msg m.Message, ack func(), nack func())) {
+	for d := range deliveries {
+		delivery := d
+		ack := func() {
+			_ = delivery.Ack(false) // confirma solo este mensaje
+		}
+		nack := func() {
+			_ = delivery.Nack(false, true) // solo este mensaje, reintentar
+		}
+
+		callbackFunc(m.Message{Body: string(delivery.Body)}, ack, nack)
+	}
+}
+
 func (r *RabbitMQQueueMiddleware) StartConsuming(callbackFunc func(msg m.Message, ack func(), nack func())) error {
 	if r.conn == nil || r.conn.IsClosed() || r.ch == nil || r.ch.IsClosed() {
 		return m.ErrMessageMiddlewareDisconnected
@@ -36,10 +50,10 @@ func (r *RabbitMQQueueMiddleware) StartConsuming(callbackFunc func(msg m.Message
 	deliveries, err := r.ch.Consume(
 		r.queueName,
 		tag,
-		false,
-		false,
-		false,
-		false,
+		false, // confirmacion manual con ack/nack
+		false, // cola compartida entre varios workers
+		false, // permitir recibir mensajes de la misma conexion
+		false, // esperar confirmacion
 		nil,
 	)
 	if err != nil {
@@ -51,17 +65,7 @@ func (r *RabbitMQQueueMiddleware) StartConsuming(callbackFunc func(msg m.Message
 		return m.ErrMessageMiddlewareMessage
 	}
 
-	for d := range deliveries {
-		delivery := d
-		ack := func() {
-			_ = delivery.Ack(false)
-		}
-		nack := func() {
-			_ = delivery.Nack(false, true)
-		}
-
-		callbackFunc(m.Message{Body: string(delivery.Body)}, ack, nack)
-	}
+	processDeliveries(deliveries, callbackFunc)
 
 	// Para distinguir entre StopConsuming y si hubo error
 	wasManual := r.manualStop
@@ -105,11 +109,17 @@ func (r *RabbitMQQueueMiddleware) Send(msg m.Message) error {
 		return m.ErrMessageMiddlewareDisconnected
 	}
 
-	err := r.ch.Publish("", r.queueName, false, false, amqp.Publishing{
-		DeliveryMode: amqp.Persistent,
-		ContentType:  "text/plain",
-		Body:         []byte(msg.Body),
-	})
+	err := r.ch.Publish(
+		"",
+		r.queueName,
+		false, // no devolver error si no hay cola bound
+		false, // no exigir consumidor inmediato
+		amqp.Publishing{
+			DeliveryMode: amqp.Persistent,
+			ContentType:  "text/plain",
+			Body:         []byte(msg.Body),
+		},
+	)
 	if err != nil {
 		if errors.Is(err, amqp.ErrClosed) || r.conn.IsClosed() || r.ch.IsClosed() {
 			return m.ErrMessageMiddlewareDisconnected
@@ -147,7 +157,14 @@ func CreateQueueMiddleware(queueName string, connectionSettings m.ConnSettings) 
 		return nil, m.ErrMessageMiddlewareDisconnected
 	}
 
-	_, err = ch.QueueDeclare(queueName, false, false, false, false, nil)
+	_, err = ch.QueueDeclare(
+		queueName,
+		false, // cola no durable
+		false, // no borrar la cola si los workers se desconectan
+		false, // cola compartida entre varios workers
+		false, // esperar confirmacion
+		nil,
+	)
 	if err != nil {
 		_ = ch.Close()
 		_ = conn.Close()
@@ -176,22 +193,21 @@ type RabbitMQExchangeMiddleware struct {
 	manualStop   bool
 }
 
-func (r *RabbitMQExchangeMiddleware) StartConsuming(callbackFunc func(msg m.Message, ack func(), nack func())) error {
-	if r.conn == nil || r.conn.IsClosed() || r.ch == nil || r.ch.IsClosed() {
-		return m.ErrMessageMiddlewareDisconnected
-	}
-	if r.isConsuming {
-		return m.ErrMessageMiddlewareMessage
-	}
-
-	q, err := r.ch.QueueDeclare("", false, true, true, false, nil)
+func (r *RabbitMQExchangeMiddleware) setupSubscriberQueue() (string, error) {
+	q, err := r.ch.QueueDeclare(
+		"",    // nombre vacio, rabbitmq genera uno
+		false, // cola no durable
+		true,  // borrar la cola al desconectarse el suscriptor
+		true,  // cola exclusiva
+		false, // esperar confirmacion
+		nil,
+	)
 	if err != nil {
 		if errors.Is(err, amqp.ErrClosed) || r.conn.IsClosed() || r.ch.IsClosed() {
-			return m.ErrMessageMiddlewareDisconnected
+			return "", m.ErrMessageMiddlewareDisconnected
 		}
-		return m.ErrMessageMiddlewareMessage
+		return "", m.ErrMessageMiddlewareMessage
 	}
-	r.queueName = q.Name
 
 	keys := r.routingKeys
 	if len(keys) == 0 {
@@ -204,16 +220,33 @@ func (r *RabbitMQExchangeMiddleware) StartConsuming(callbackFunc func(msg m.Mess
 			q.Name,
 			key,
 			r.exchangeName,
-			false,
+			false, // esperar confirmacion
 			nil,
 		)
 		if err != nil {
 			if errors.Is(err, amqp.ErrClosed) || r.conn.IsClosed() || r.ch.IsClosed() {
-				return m.ErrMessageMiddlewareDisconnected
+				return "", m.ErrMessageMiddlewareDisconnected
 			}
-			return m.ErrMessageMiddlewareMessage
+			return "", m.ErrMessageMiddlewareMessage
 		}
 	}
+
+	return q.Name, nil
+}
+
+func (r *RabbitMQExchangeMiddleware) StartConsuming(callbackFunc func(msg m.Message, ack func(), nack func())) error {
+	if r.conn == nil || r.conn.IsClosed() || r.ch == nil || r.ch.IsClosed() {
+		return m.ErrMessageMiddlewareDisconnected
+	}
+	if r.isConsuming {
+		return m.ErrMessageMiddlewareMessage
+	}
+
+	queueName, err := r.setupSubscriberQueue()
+	if err != nil {
+		return err
+	}
+	r.queueName = queueName
 
 	r.consumerSeq++
 	tag := fmt.Sprintf("ex-cons-%s-%d", r.exchangeName, r.consumerSeq)
@@ -222,12 +255,12 @@ func (r *RabbitMQExchangeMiddleware) StartConsuming(callbackFunc func(msg m.Mess
 	r.manualStop = false
 
 	deliveries, err := r.ch.Consume(
-		q.Name,
+		r.queueName,
 		tag,
-		false,
-		false,
-		false,
-		false,
+		false, // confirmacion manual con ack/nack
+		false, // cola compartida entre varios workers
+		false, // permitir recibir mensajes de la misma conexion
+		false, // esperar confirmacion
 		nil,
 	)
 	if err != nil {
@@ -239,17 +272,7 @@ func (r *RabbitMQExchangeMiddleware) StartConsuming(callbackFunc func(msg m.Mess
 		return m.ErrMessageMiddlewareMessage
 	}
 
-	for d := range deliveries {
-		delivery := d
-		ack := func() {
-			_ = delivery.Ack(false)
-		}
-		nack := func() {
-			_ = delivery.Nack(false, true)
-		}
-
-		callbackFunc(m.Message{Body: string(delivery.Body)}, ack, nack)
-	}
+	processDeliveries(deliveries, callbackFunc)
 
 	wasManual := r.manualStop
 	r.isConsuming = false
@@ -276,7 +299,7 @@ func (r *RabbitMQExchangeMiddleware) StopConsuming() error {
 	}
 
 	r.manualStop = true
-	err := r.ch.Cancel(r.consumerTag, false)
+	err := r.ch.Cancel(r.consumerTag, false) // esperar confirmacion para cancelar
 	if err != nil {
 		if errors.Is(err, amqp.ErrClosed) || r.conn.IsClosed() || r.ch.IsClosed() {
 			return m.ErrMessageMiddlewareDisconnected
@@ -301,8 +324,8 @@ func (r *RabbitMQExchangeMiddleware) Send(msg m.Message) error {
 		err := r.ch.Publish(
 			r.exchangeName,
 			key,
-			false,
-			false,
+			false, // no devolver error si no hay suscriptor en esa key
+			false, // no exigir suscriptor inmediato
 			amqp.Publishing{
 				DeliveryMode: amqp.Persistent,
 				ContentType:  "text/plain",
@@ -348,7 +371,15 @@ func CreateExchangeMiddleware(exchange string, keys []string, connectionSettings
 		return nil, m.ErrMessageMiddlewareDisconnected
 	}
 
-	err = ch.ExchangeDeclare(exchange, "direct", false, false, false, false, nil)
+	err = ch.ExchangeDeclare(
+		exchange,
+		"direct",
+		false, // exchange no durable
+		false, // no borrar el exchange si se desvinculan colas
+		false, // permite que los productores publiquen directo
+		false, // esperar confirmacion
+		nil,
+	)
 	if err != nil {
 		_ = ch.Close()
 		_ = conn.Close()
